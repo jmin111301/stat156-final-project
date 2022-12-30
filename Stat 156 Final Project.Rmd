@@ -1,0 +1,795 @@
+---
+title: "Stat 156 Final Project Data Analysis"
+output: html_document
+date: "2022-12-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+For this project, we are replicating "Clearing the Air? The Effects of Gasoline Content Regulation on Air Quality" by Auffhammer and Kellogg (2011). Specifically, we replicate the main difference-in-difference results in the paper. We also replicated their robustness checks in this portion of the project. As for their regression discontinuity analysis, we reanalyzed their results utilizing a regression discontinuity framework, specifically using the rdrobust package in R to analyze the effect of the CARB policy on California ozone levels.
+
+# Install Packages
+
+```{r message = FALSE}
+library(haven)
+library(tidyverse)
+library(dplyr)
+library(glue)
+library(miceadds)
+library(fastDummies)
+library(readr)
+library(rdrobust)
+library(rddtools)
+```
+
+# Read in Data
+
+To give some context for our data, we gathered the data from the AER website. We attempted to obtain raw data from the authors, however, Professor Auffhammer declined to share data because of the ongoing UC strike and encouraged us to utilize the data from the American Economics Review. Nevertheless, the data still needed to be preprocessed for analysis.
+
+**NOTE: Change eval = FALSE to eval = TRUE to make run all of data cleaning chunks. We did this to save computational load when knitting the file. Also uncomment the other two lines.**
+
+```{r eval = TRUE}
+df <- read_dta("/Users/jonathanmin/Downloads/112465-V1/AER20090377_DataAndPrograms/AER20090377_FinalData.dta")
+#df.income <- read_dta("/Users/jonathanmin/Downloads/112465-V1/AER20090377_DataAndPrograms/AER20090377_IncomeData.dta")
+#df.neighbor <- read_dta("/Users/jonathanmin/Downloads/112465-V1/AER20090377_DataAndPrograms/AER20090377_NeighborData.dta")
+```
+
+# Data Cleaning
+
+### Create a list of valid summer ID's
+
+```{r, message = FALSE, eval = FALSE}
+# Filter by June, July, August and years 1989-2003 and more than 9 valid hours
+valid_years_filter <- df %>% filter(month %in% c(6,7,8) & year < 2004 & valid >= 9)
+
+# Create a list of valid monitor years in the summer
+valid_years_filter <- valid_years_filter %>% group_by(site_id, year, fips) %>% summarize(valid_years = n()) %>% filter(valid_years >= 69) %>% select(-c(valid_years))
+
+# Keep the df with only the valid monitor years
+df_temp <- df %>% filter(valid >= 9) 
+df_temp <- merge(x=valid_years_filter,y=df_temp, 
+             by=c("fips", "site_id", "year"),
+             all=FALSE) 
+df_temp <- df_temp %>% arrange(fips)
+
+# Drop monitors in untreated counties that border treated counties
+neighbor_fips <- df.neighbor$fips
+df_temp1 <- df_temp %>% filter(!(fips %in% neighbor_fips))
+
+# Make sure that CARB and RFG are mutually exclusive (both cannot be active)
+df_temp1 <- df_temp1 %>% mutate(treat_rfg = if_else(treat_CARB == 1, 0, treat_rfg))
+```
+
+### Add weather variables for regression
+
+```{r eval = FALSE}
+# Add DOW and DOY
+df_temp1 <- df_temp1 %>% mutate(DOW = as.POSIXlt(Date)$wday)
+df_temp1 <- df_temp1 %>% mutate(DOY = as.POSIXlt(Date)$yday)
+
+df_temp2 <- df_temp1
+# Creates dummy variables for DOW and interactions with TempMax, TempMin, Rain, Snow
+temporary_DM <- dummy_cols(df_temp1, select_columns = c("DOW")) %>% select(starts_with("DOW_")) * df_temp1$TempMax
+colnames(temporary_DM) <- paste(colnames(temporary_DM), "DM", sep = "_")
+
+temporary_Dm <- dummy_cols(df_temp1, select_columns = c("DOW")) %>% select(starts_with("DOW_")) * df_temp1$TempMin
+colnames(temporary_Dm) <- paste(colnames(temporary_Dm), "Dm", sep = "_")
+
+temporary_Dr <- dummy_cols(df_temp1, select_columns = c("DOW")) %>% select(starts_with("DOW_")) * df_temp1$Rain
+colnames(temporary_Dr) <- paste(colnames(temporary_Dr), "Dr", sep = "_")
+
+temporary_Ds <- dummy_cols(df_temp1, select_columns = c("DOW")) %>% select(starts_with("DOW_")) * df_temp1$Snow
+colnames(temporary_Ds) <- paste(colnames(temporary_Ds), "Ds", sep = "_")
+
+df_temp2 = df_temp2 %>% cbind(temporary_DM, temporary_Dm, temporary_Dr, temporary_Ds)
+
+df_temp2 <- df_temp2 %>% mutate(TempMax1 = TempMax,
+                                TempMax2 = TempMax^2,
+                                TempMax3 = TempMax^3,
+                                TempMin1 = TempMin,
+                                TempMin2 = TempMin^2,
+                                TempMin3 = TempMin^3,
+                                TempMaxMin = TempMax * TempMin,
+                                Rain1 = Rain,
+                                Rain2 = Rain^2,
+                                Snow1 = Snow,
+                                Snow2 = Snow^2,
+                                RainTempMax = Rain * TempMax)
+  
+df_temp2 <- df_temp2 %>% arrange(fips, site_id, Date)
+df_temp2 <- df_temp2 %>% mutate(DOY = as.POSIXlt(Date)$yday)
+df_temp2["DOYL1"] = lag(df_temp2$DOY, k= 1)
+df_temp2 <- df_temp2 %>% mutate(DOYdiff = DOY - DOYL1)
+
+df_temp2["TempMaxL1"] = lag(df_temp2$TempMax, k= 1)
+df_temp2["TempMinL1"] = lag(df_temp2$TempMin, k = 1)
+df_temp2 <- df_temp2 %>% mutate(TempMaxMaxL1 = TempMax * TempMaxL1,
+                                TempMaxMinL1 = TempMax * TempMinL1)
+df_temp2 <- df_temp2 %>% filter(month %in% c(6,7,8))
+df_temp2 %>% dim
+# df_temp2 <- df_temp2 %>% filter(DOYdiff == 1)
+# This step should bring us down 2,449,057
+# 3602060 - 2449057 = 1153003; we hit our target
+
+#Interactions
+temp <- df_temp2 %>% select(starts_with("TempM")) * df_temp2$DOY
+colnames(temp) = paste("DOY", colnames(temp), sep = "_")
+
+temp1 <- df_temp2 %>% select(starts_with("Rai")) * df_temp2$DOY
+colnames(temp1) = paste("DOY", colnames(temp1), sep = "_")
+
+temp2 <- df_temp2 %>% select(starts_with("Snow")) * df_temp2$DOY
+colnames(temp2) = paste("DOY", colnames(temp2), sep = "_")
+
+df_temp2 <- cbind(df_temp2, temp, temp1, temp2)
+```
+
+### Add income data to our main data
+
+```{r eval = FALSE}
+# Include income data and also get rid of na values
+df_temp3 <- merge(x=df_temp2,y=df.income, 
+             by=c("state_code","county_code", "year"))
+
+df_temp3 <- df_temp3 %>% filter(!(is.na(income)))
+# Target is 1144556 
+                             
+df_temp3 <- df_temp3 %>% filter(!(ozone_max==0) & !(epa_8hr==0))
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMax1))
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMax2))
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMax3))
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMin1))
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMin2)) 
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMin3)) 
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMaxMin)) 
+df_temp3 <- df_temp3 %>% filter(!is.na(Rain1)) 
+df_temp3 <- df_temp3 %>% filter(!is.na(Rain2)) 
+df_temp3 <- df_temp3 %>% filter(!is.na(Snow1)) 
+df_temp3 <- df_temp3 %>% filter(!is.na(Snow2)) 
+df_temp3 <- df_temp3 %>% filter(!is.na(RainTempMax))
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMaxL1))
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMinL1))
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMaxMaxL1))
+df_temp3 <- df_temp3 %>% filter(!is.na(TempMaxMinL1))
+df_temp3 <- df_temp3 %>% mutate(lozone_max = log(ozone_max),
+                                lozone_8hr = log(epa_8hr))
+
+# our error is 91 observations
+```
+
+### Create region features and interactions for our main data
+
+```{r eval = FALSE}
+# Mutate a feature for regions (as factor)
+df_temp4 <- df_temp3 %>% mutate(region= case_when(state_code %in% c(2, 4, 6, 8, 15, 16, 30, 32, 35, 41, 49, 53, 56) ~ 4,
+                                             state_code %in% c(1, 5, 10, 11, 12, 13, 21, 22, 24, 28, 37, 40, 45, 47, 48, 51, 54) ~ 3,
+                                             state_code %in% c(17, 18, 19, 20, 26, 27, 29, 31, 38, 39, 46, 55) ~ 2,
+                                             state_code %in% c(9, 23, 25, 33, 34, 36, 42, 44, 50) ~ 1))
+
+# Creates dummy variables for DOW and interactions with TempMax, TempMin, Rain, Snow
+temporary_R <- dummy_cols(df_temp4, select_columns = c("region")) %>% select(starts_with("region_"))
+
+temporary_DOW <- dummy_cols(df_temp4, select_columns = c("DOW")) %>% select(starts_with("DOW_")) 
+temporary_DOW <- temporary_DOW %>% select((temporary_DOW %>% names)[29:35])
+temporary_y <- dummy_cols(df_temp4, select_columns = c("year")) %>% select(starts_with("year_"))
+
+
+# Get interactions year*region
+i = 1
+blank_temp_y = temporary_y 
+output = temporary_y
+for (region_name in (temporary_R %>% colnames)){
+  temp <- temporary_y * temporary_R[region_name] %>% as.vector
+  colnames(temp) <- paste(paste(colnames(temporary_y), "RY", sep = "_"), as.character(i), sep = "")
+  output <- cbind(output, temp)
+  i = i + 1
+  temporary_y <- blank_temp_y
+}
+temporaryRY <- output
+
+# Get interactions DOW*region
+i = 1
+blank_temp_DOW = temporary_DOW
+output = temporary_DOW
+for (region_name in (temporary_R %>% colnames)){
+  temp <- temporary_DOW * temporary_R[region_name] %>% as.vector
+  colnames(temp) <- paste(paste(colnames(temporary_DOW), "RW", sep = "_"), as.character(i), sep = "")
+  output <- cbind(output, temp)
+  i = i + 1
+  temporary_DOW <- blank_temp_DOW
+}
+temporaryRW <- output
+
+# Get interactions DOY*region
+temporaryRD <- temporary_R * df_temp3$DOY
+colnames(temporaryRD) <- paste(colnames(temporaryRD), "RD", sep = "_")
+
+df_temp4 <- cbind(df_temp4, temporary_R, temporaryRY, temporaryRW, temporaryRD)
+
+# Include time trend
+df_temp4["TimeTrend"] =  as.POSIXlt(df_temp4$Date)$year + as.POSIXlt(df_temp4$Date)$yday/365	
+df_temp4["TimeTrendSquared"] =  df_temp4$TimeTrend^2
+```
+
+### Create variables to signify whether a county was hit with RVP or RFG or CARB, or a combination (all variables mutually exclusive)
+
+```{r eval = FALSE}
+df_temp5 <- df_temp4 %>% mutate(treat_rvpI = as.logical(treat_rvpI),
+                                treat_rvpII = as.logical(treat_rvpII),
+                                treat_rfg = as.logical(treat_rfg),
+                                treat_CARB = as.logical(treat_CARB))
+county_policy <-  df_temp5 %>% group_by(fips) %>% summarise(RVP.county = any(treat_rvpI) | any(treat_rvpII),
+                                                            RFG.county =any(treat_rfg),
+                                                            CARB.county = any(treat_CARB))
+# Checks if a county had both RFG and RVP policies ever 
+county_policy <- county_policy %>% mutate(RVP.RFG.county = RFG.county == 1 & RVP.county == 1)
+county_policy <- county_policy %>% mutate(RFG.county = ifelse(RVP.RFG.county == 1, 0, RFG.county),
+                                          CARB.county = ifelse(RVP.RFG.county == 1, 0, CARB.county))
+
+# Checks if a county had both CARB and RFG/RVP
+county_policy <- county_policy %>% mutate(CARB.RFG.county = (RFG.county ==1 | RVP.RFG.county==1) & CARB.county ==1)
+county_policy <- county_policy %>% mutate(RFG.county = ifelse(CARB.RFG.county == 1, 0, RFG.county),
+                                          RVP.RFG.county = ifelse(CARB.RFG.county == 1, 0, RVP.RFG.county), 
+                                          CARB.county = ifelse(CARB.RFG.county == 1, 0, CARB.county))
+
+
+# Merge county_policy to final_summer_df
+df_temp5 <- merge(x=df_temp5,y=county_policy, 
+             by=c("fips"),
+             all=TRUE) 
+```
+
+### Add interactions between county type and time trends
+
+```{r eval = FALSE}
+# We want to center our interaction terms to reduce colinearity
+interaction <- function(vect1, vect2){
+  centered_vect1 = vect1 - mean(vect1)
+  centered_vect2 = vect2 - mean(vect2)
+  return (centered_vect1 * centered_vect2)
+}
+df_temp6 <- df_temp5
+# Add interactions between county type and time trends (county type * region * time trend) and county type and quadratic time trends (county type * region * time trend)
+for (i in 1:4){
+  # Add the variables
+  df_temp6 <- df_temp6 %>% mutate("TrendRVP.{i}" := if_else(RVP.county == 1 & region == i, TimeTrend, 0),
+                                  "TrendRFG.{i}" := if_else(RFG.county == 1 & region == i, TimeTrend, 0),
+                                  "TrendRVPRFG.{i}" := if_else(RVP.RFG.county == 1 & region == i, TimeTrend, 0),
+                                  "TrendCARB.{i}" := if_else(CARB.county == 1 & region == i, TimeTrend, 0),
+                                  "TrendCARBRFG.{i}" := if_else(CARB.RFG.county == 1 & region == i, TimeTrend, 0),
+                                  "QuadraticTrendRVP.{i}" := if_else(RVP.county == 1 & region == i, TimeTrendSquared, 0),
+                                  "QuadraticTrendRFG.{i}" := if_else(RFG.county == 1 & region == i, TimeTrendSquared, 0),
+                                  "QuadraticTrendRVPRFG.{i}" := if_else(RVP.RFG.county == 1 & region == i, TimeTrendSquared, 0),
+                                  "QuadraticTrendCARB.{i}" := if_else(CARB.county == 1 & region == i, TimeTrendSquared, 0),
+                                  "QuadraticTrendCARBRFG.{i}" := if_else(CARB.RFG.county == 1 & region == i, TimeTrendSquared, 0))
+}
+
+final_df <- df_temp6
+
+# Write to CSV file to save the computational load for recleaning the data
+write_csv(final_df, "/Users/jonathanmin/Downloads/stat 156 final project/final_df.csv")
+```
+
+### Only run this portion for analysis (contains our cleaned main data for DD analysis)
+
+```{r}
+# Reread the final_df data
+final_df <- read.csv("/Users/jonathanmin/Downloads/stat 156 final project/final_df.csv")
+```
+
+# Summary Statistics
+
+```{r warning = FALSE}
+# Create summary statistics on monitors and regulation for the summer ozone season
+df_tab <- final_df %>% select(c(site_id, state_code, county_code, year, urban, treat_rvpI, treat_rvpII, treat_rfg, treat_CARB, fips)) 
+df_tab <- df_tab %>% mutate(county_id  = paste(as.character(state_code), as.character(county_code)),
+                            monitor_id = paste(as.character(state_code), as.character(county_code), as.character(site_id)))
+# Transforming features to logical for ease of making the summary statistics table
+df_tab <- df_tab %>% mutate(rural = (urban %in% c(3)),
+                            urban = (urban %in% c(1)))
+df_tab <- df_tab %>% mutate(treat_rvpI = as.logical(treat_rvpI),
+                            treat_rvpII = as.logical(treat_rvpII),
+                            treat_rfg = as.logical(treat_rfg),
+                            treat_CARB = as.logical(treat_CARB))
+
+# Creating monitor counts which creates the Urban, Rural, RVPI< RVPII, RFG95, CARB counts for the summary statistics table
+monitor_counts <- df_tab %>% group_by(monitor_id, year) %>% summarize(urban_count = all(urban),
+                                        rural_count = all(rural))
+
+monitor_counts <- monitor_counts %>% group_by(year) %>% summarize(urban_count = sum(urban_count),
+                                        rural_count = sum(rural_count))
+
+county_counts <- df_tab %>% group_by(fips, year) %>% summarize(RVPI = all(treat_rvpI),
+                                                               RVPII = all(treat_rvpII),
+                                                               RFG95 = all(treat_rfg),
+                                                               CARB = all(treat_CARB))
+
+county_counts <- county_counts %>% group_by(year) %>% summarize(RVPI = sum(RVPI),
+                                                               RVPII = sum(RVPII),
+                                                               RFG95 = sum(RFG95),
+                                                               CARB = sum(CARB))
+
+# Grouping by year to get the total number of observations, counties, total monitors 
+df_tab <- df_tab %>% group_by(year) %>% summarize(observations = length(year),
+                                        county = length(unique(fips)),
+                                        total_monitors = length(unique(monitor_id)))
+
+# Final merges to get out summary statistics table
+df_summary <- merge(x=df_tab,y=monitor_counts, 
+             by=c("year"),
+             all=TRUE) 
+
+
+df_summary <- merge(x=df_summary,y=county_counts, 
+             by=c("year"),
+             all=TRUE) 
+
+# Should roughly match the summary table in page 2695 of the paper
+df_summary %>% view
+```
+
+# Replication and Robustness Checks: Difference-in-Difference Analysis
+
+## Preliminary work: Need to mean-difference the data by panelid
+
+```{r}
+# Add and remove X's depending on how we read in the data
+final_df <- final_df %>% select(-c("X_merge", "X_mergeurb", "NumOffMax", "NumOffMin", "NumOff1Max", "NumOff1Min", "NOtherStationprcp", "EstTempFlagprcp", "NOtherStation", "SiteObsprcp", "X_merge2", "X_merge3", "RFGStart2", "RFGEnd2", "RVPStart2", "RVPEnd2", "RegFlag", "RFGEnd", "RFGStart", "RVPEnd", "RVPStart", "noxeffect", "rfgtype", "sulfurppm", "sulfur", "psi", "fedvssip", "regtype", "state", "county", "partial", "partialinfo", "Date", "RVPI", "EstTempFlag", "DOW"))
+
+diffed_df_parts <- final_df %>% select(-c("state_code", "fips", "county_code", "year", "site_id", "valid", "day", "month", "SiteObs", "urban"))
+non_diffed_df_parts <- final_df %>% select(c("state_code", "fips" , "county_code", "year", "site_id", "valid", "day", "month", "SiteObs", "urban"))
+
+
+final_df_means <- diffed_df_parts %>% group_by(panelid) %>% summarize(across(everything(), list(mean)))
+model_ids <- final_df$panelid %>% as.matrix %>% as.data.frame %>% rename(panelid = V1)
+final_df_panel_means <- merge(x=model_ids,y=final_df_means, 
+             by=c("panelid")) 
+# Take out panel id and re-add it to the df
+panelid <- diffed_df_parts$panelid
+diffed_df_parts <- diffed_df_parts %>% select(-c("panelid"))
+final_df_panel_means <- final_df_panel_means %>% select(-c("panelid"))
+final_dfD <- diffed_df_parts - final_df_panel_means
+final_dfD <- final_dfD %>% mutate(income = income/1000000000)
+final_dfD <- cbind(panelid, non_diffed_df_parts, final_dfD)
+```
+
+## Analysis (Replication/Robustness Check)
+
+Our robustness check primarily hopes to satisfy the following identification condition $\text{E}[\textbf{Treat}_{ct} * \epsilon_{it} | \mu_i, \eta_{ry}] = 0$. However, it may not hold if the long-term trend of air quality in treated counties is different from the trend in control counties. As such, in our analysis, we add additional variables to our model to improve the precision the estimates and control for factors that affect both counties differently over time. There is an additional identification assumption of this new DD model that unobserved factors aren't correlated with the treatment conditional on covariates. This assumption is invalid if there are other significant unobserved factors that may affect ozone concentrations in a nonlinear fashion and aren't captured by the features we encode in the model. In our analysis, we begin with the base model (which may not satisfy the first identification condition) and progressively add more covariates in the model to improve estimation.
+
+**NOTE: we commented out the code for the models to run but left the summary statistics for each below in comments. We did this because of the computational load in knitting an rmd file.**
+
+```{r}
+# Response variable: ozone_max
+model_data <- final_dfD %>% mutate(StateYear = paste(as.character(state_code), as.character(year)))
+col_names <- model_data %>% names
+### Model 1: Base model
+## lozone_max
+#model <- lm.cluster(lozone_max ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB - 1, data = model_data, cluster = "StateYear")
+
+#                Estimate Std. Error     t value   Pr(>|t|)
+#treat_rvpI   0.000960303 0.01146651  0.08374853 0.93325637
+#treat_rvpII  0.001362317 0.01378869  0.09879959 0.92129739
+#treat_rfg    0.020999995 0.01448648  1.44962758 0.14716240
+#treat_CARB  -0.048947383 0.02329707 -2.10101058 0.03564004 *
+#model %>% summary
+
+## lepa_8hr
+#model <- lm.cluster(lozone_8hr ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB - 1, data = model_data, cluster = "StateYear")
+
+#                 Estimate Std. Error     t value   Pr(>|t|)
+#treat_rvpI  -0.0036149765 0.01196261 -0.30218954 0.76250758
+#treat_rvpII  0.0002170978 0.01356998  0.01599838 0.98723568
+#treat_rfg    0.0346884670 0.01456197  2.38212758 0.01721293 *
+#treat_CARB  -0.0332342037 0.02279510 -1.45795408 0.14485320
+#model %>% summary
+
+### Model 2: add Region*Year FE and M
+region_dummies <- col_names[grepl("_RY", col_names , fixed = TRUE)] %>% 
+  append(col_names[grepl("_RY", col_names , fixed = TRUE)]) %>%
+  append(col_names[101:119]) 
+
+# Run DD on with log_ozone_max as dependent
+fmla <- as.formula(paste("lozone_max ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + ", paste(region_dummies, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, data = model_data, cluster = "StateYear")
+
+#              Estimate     Std. Error   t value    Pr(>|t|)
+#treat_rvpI    -0.001328548 0.02149081  -0.06181936 9.507067e-01
+#treat_rvpII   -0.003079630 0.01320100  -0.23328764 8.155381e-01
+#treat_rfg     -0.007401028 0.01642515  -0.45059105 6.522843e-01
+#treat_CARB    -0.090756346 0.01683431  -5.39115454 7.000644e-08 ***
+#model %>% summary
+
+# Run DD on with log_epa_8hr as dependent
+fmla <- as.formula(paste("lozone_8hr ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + ", paste(region_dummies, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, cluster = "StateYear", data = model_data)
+
+#                   Estimate Std. Error      t value     Pr(>|t|)
+#treat_rvpI    -0.0017974108 0.02191307  -0.08202461 9.346271e-01
+#treat_rvpII   -0.0025041950 0.01300762  -0.19251752 8.473368e-01
+#treat_rfg      0.0003519883 0.01627917   0.02162201 9.827495e-01
+#treat_CARB    -0.0914918574 0.01654639  -5.52941629 3.212981e-08 ***
+#model %>% summary
+
+### Model 3: add region*DOW FE and region*DOY FE
+R_dummies <- col_names[grepl("_RY", col_names , fixed = TRUE)] %>% 
+  append(col_names[grepl("_RD", col_names , fixed = TRUE)]) %>%
+  append(col_names[grepl("_RW", col_names , fixed = TRUE)]) %>%
+  append(col_names[101:119]) 
+
+# Run DD on with log_ozone_max as dependent
+fmla <- as.formula(paste("lozone_max ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + ", paste(R_dummies, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, data = model_data, cluster = "StateYear")
+
+#                   Estimate   Std. Error      t value     Pr(>|t|)
+#treat_rvpI    -0.0011474236 0.0215097188  -0.05334443 9.574575e-01
+#treat_rvpII   -0.0028198434 0.0131855341  -0.21385887 8.306571e-01
+#treat_rfg     -0.0075386403 0.0164165864  -0.45920876 6.460843e-01
+#treat_CARB    -0.0908449495 0.0168405633  -5.39441277 6.874802e-08 ***
+#model1 %>% summary
+
+# Run DD on with log_epa_8hr as dependent
+fmla <- as.formula(paste("lozone_8hr ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + ", paste(R_dummies, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, cluster = "StateYear", data = model_data)
+
+#                   Estimate   Std. Error      t value     Pr(>|t|)
+#treat_rvpI    -1.726416e-03 0.0219391656  -0.07869103 9.372784e-01
+#treat_rvpII   -2.298683e-03 0.0129942070  -0.17690059 8.595865e-01
+#treat_rfg      4.424814e-04 0.0162754941   0.02718697 9.783106e-01
+#treat_CARB    -9.138714e-02 0.0165636747  -5.51732250 3.442034e-08
+#model %>% summary
+
+### Model 4: add weather controls
+fmla_names <- col_names[grepl("_RY", col_names , fixed = TRUE)] %>% 
+  append(col_names[grepl("_RD", col_names , fixed = TRUE)]) %>%
+  append(col_names[grepl("_RW", col_names , fixed = TRUE)]) %>%
+  append(col_names[101:119])%>%
+  append(col_names[grepl("Rain", col_names , fixed = TRUE)]) %>% 
+  append(col_names[grepl("Temp", col_names , fixed = TRUE)]) %>%
+  append(col_names[grepl("Snow", col_names , fixed = TRUE)]) %>% unique()
+
+# Run DD on with log_ozone_max as dependent
+fmla <- as.formula(paste("lozone_max ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + ", paste(fmla_names, collapse= "+"), "- 1"))
+# model <- lm.cluster(fmla, data = model_data, cluster = "StateYear")
+
+#model %>% summary
+
+# Run DD on with log_epa_8hr as dependent
+fmla <- as.formula(paste("lozone_8hr ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + ", paste(fmla_names, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, data = model_data, cluster = "StateYear")
+
+#                      Estimate   Std. Error      t value     Pr(>|t|)
+#treat_rvpI        3.915724e-03 2.123551e-02   0.18439514 8.537035e-01
+#treat_rvpII      -6.652033e-03 1.083981e-02  -0.61366670 5.394356e-01
+#treat_rfg        -3.026837e-03 1.346713e-02  -0.22475740 8.221680e-01
+#treat_CARB       -7.233745e-02 1.475669e-02  -4.90201154 9.486026e-07 ***
+
+#model %>% summary
+
+### Model 5: add income
+
+# Run DD on with log_ozone_max as dependent
+fmla <- as.formula(paste("lozone_max ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + income + ", paste(fmla_names, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, data = model_data, cluster = "StateYear")
+
+#                      Estimate   Std. Error      t value     Pr(>|ti |)
+#treat_rvpI        7.036669e-03 1.997689e-02   0.35224052 7.246579e-01
+#treat_rvpII      -4.346577e-03 9.990575e-03  -0.43506780 6.635132e-01
+#treat_rfg         2.116574e-03 1.504156e-02   0.14071513 8.880950e-01 
+#treat_CARB       -6.003813e-02 1.427893e-02  -4.20466523 2.614689e-05 ***
+#income           -1.254932e+00 5.038892e-01  -2.49049150 1.275665e-02 *
+
+#model %>% summary
+
+# Run DD on with log_epa_8hr as dependent
+fmla <- as.formula(paste("lozone_8hr ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + income + ", paste(fmla_names, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, data = model_data, cluster = "StateYear")
+
+#                      Estimate   Std. Error      t value     Pr(>|t|)
+#treat_rvpI        5.832534e-03 2.107642e-02   0.27673260 7.819854e-01
+#treat_rvpII      -3.271500e-03 1.007089e-02  -0.32484696 7.452969e-01
+#treat_rfg         8.093237e-03 1.512489e-02   0.53509406 5.925848e-01
+#treat_CARB       -6.312401e-02 1.427289e-02  -4.42265009 9.749757e-06 ***
+#income           -1.037360e+00 5.070371e-01  -2.04592468 4.076378e-02 *
+
+#model %>% summary
+
+### Model 6: Add Linear Trends
+# Run DD on with log_ozone_max as dependent
+fmla_names <- fmla_names %>% 
+  append(col_names[grepl("Trend", col_names , fixed = TRUE)])
+fmla_names_noQ <- fmla_names[!fmla_names %in% grep(paste0(c("Quadratic"), collapse = "|"), fmla_names, value = T)]
+
+fmla <- as.formula(paste("lozone_max ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + income + ", paste(fmla_names_noQ, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, data = model_data, cluster = "StateYear")
+
+#                      Estimate   Std. Error      t value     Pr(>|t|)
+#treat_rvpI        1.728757e-02 2.225794e-02   0.77669211 4.373404e-01 
+#treat_rvpII       1.548875e-04 9.066138e-03   0.01708417 9.863695e-01
+#treat_rfg         1.045514e-02 2.276318e-02   0.45930066 6.460183e-01 
+#treat_CARB       -7.764821e-02 2.437584e-02  -3.18545778 1.445252e-03 ***
+#income            1.208619e-01 5.596043e-01   0.21597737 8.290054e-01 
+
+#model %>% summary
+
+# Run DD on with log_epa_8hr as dependent
+fmla <- as.formula(paste("lozone_8hr ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + income + ", paste(fmla_names_noQ, collapse= "+"), "- 1"))
+
+#model <- lm.cluster(fmla, data = model_data, cluster = "StateYear")
+
+#                      Estimate   Std. Error      t value     Pr(>|t|)
+#treat_rvpI        2.184427e-02 2.291281e-02   0.95336509 3.404051e-01 
+#treat_rvpII       1.439502e-03 9.377204e-03   0.15351085 8.779954e-01
+#treat_rfg         1.356356e-02 2.291722e-02   0.59185025 5.539509e-01
+#treat_CARB       -8.518446e-02 2.499288e-02  -3.40834893 6.535726e-04 ***
+#income            7.530782e-03 5.529381e-01   0.01361958 9.891335e-01
+
+#model %>% summary
+
+### Model 7: Add Quadratic Trends
+# Run DD on with log_ozone_max as dependent
+fmla <- as.formula(paste("lozone_max ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + income + ", paste(fmla_names, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, data = model_data, cluster = "StateYear")
+
+#                            Estimate   Std. Error       t value     Pr(>|t|)
+#treat_rvpI              4.241909e-02 2.826386e-02  1.500824e+00 1.334010e-01
+#treat_rvpII            -4.836543e-03 9.087739e-03 -5.322053e-01 5.945838e-01
+#treat_rfg               9.535232e-03 2.422265e-02  3.936494e-01 6.938399e-01
+#treat_CARB             -9.277387e-02 2.300492e-02 -4.032784e+00 5.511990e-05 ***
+#income                  1.539614e-01 5.472371e-01  2.813430e-01 7.784473e-01
+
+#model %>% summary
+
+# Run DD on with log_epa_8hr as dependent
+fmla <- as.formula(paste("lozone_8hr ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + income + ", paste(fmla_names, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, data = model_data, cluster = "StateYear")
+
+#                            Estimate   Std. Error      t value     Pr(>|t|)
+#treat_rvpI              5.760540e-02 2.828059e-02   2.03692346 4.165771e-02 *
+#treat_rvpII            -2.735791e-03 9.416472e-03  -0.29053246 7.714089e-01
+#treat_rfg               1.485960e-02 2.385402e-02   0.62293900 5.333246e-01
+#treat_CARB             -9.736234e-02 2.332668e-02  -4.17386174 2.994795e-05 ***
+#income                  4.178111e-02 5.389708e-01   0.07752016 9.382098e-01
+
+#model %>% summary
+```
+
+## Comparing DD results across urban, suburban, rural on log daily ozone
+
+```{r}
+urban_data <- model_data %>% filter(urban == 1)
+suburban_data <- model_data %>% filter(urban == 2)
+rural_data <- model_data %>% filter(urban == 3)
+### No trend
+fmla_names <- col_names[grepl("_RY", col_names , fixed = TRUE)] %>% 
+  append(col_names[grepl("_RD", col_names , fixed = TRUE)]) %>%
+  append(col_names[grepl("_RW", col_names , fixed = TRUE)]) %>%
+  append(col_names[101:119])%>%
+  append(col_names[grepl("Rain", col_names , fixed = TRUE)]) %>% 
+  append(col_names[grepl("Temp", col_names , fixed = TRUE)]) %>%
+  append(col_names[grepl("Snow", col_names , fixed = TRUE)]) %>% unique()
+#### Urban models 
+fmla <- as.formula(paste("lozone_max ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + income + ", paste(fmla_names, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, data = urban_data, cluster = "StateYear")
+#model %>% summary
+
+#                      Estimate   Std. Error       t value     Pr(>|t|)
+#treat_rvpI       -1.943727e-02 2.994888e-02 -6.490148e-01 5.163288e-01
+#treat_rvpII      -2.066748e-02 1.744477e-02 -1.184738e+00 2.361210e-01
+#treat_rfg         1.054237e-02 2.124004e-02  4.963443e-01 6.196515e-01
+#treat_CARB       -8.698749e-02 3.077821e-02 -2.826269e+00 4.709372e-03 ***
+#income           -9.978546e-01 5.565898e-01 -1.792801e+00 7.300478e-02 *
+
+#### Suburban model
+#model <- lm.cluster(fmla, data = suburban_data, cluster = "StateYear")
+#model %>% summary
+
+#                      Estimate   Std. Error       t value     Pr(>|t|)
+#treat_rvpI        1.151863e-02 2.172695e-02  0.5301537952 5.960053e-01
+#treat_rvpII      -3.749165e-03 1.228055e-02 -0.3052928266 7.601431e-01
+#treat_rfg        -8.023264e-03 1.732263e-02 -0.4631665664 6.432450e-01
+#treat_CARB       -7.082680e-02 1.801580e-02 -3.9313720694 8.446244e-05 ***
+#income           -1.229985e+00 5.260551e-01 -2.3381287670 1.938057e-02 *
+
+#### Rural models
+#model <- lm.cluster(fmla, data = rural_data, cluster = "StateYear")
+#model %>% summary
+
+#                      Estimate   Std. Error     t value     Pr(>|t|)
+#treat_rvpI        4.078699e-02 2.309584e-02  1.76598863 7.739776e-02
+#treat_rvpII       1.832313e-03 1.186158e-02  0.15447463 8.772355e-01
+#treat_rfg        -3.004992e-03 1.351525e-02 -0.22234081 8.240486e-01
+#treat_CARB       -1.838443e-02 1.961191e-02 -0.93741145 3.485470e-01 
+#income           -1.485135e+00 8.818537e-01 -1.68410617 9.216115e-02 
+
+### Include Trend
+fmla_names <- fmla_names %>% 
+  append(col_names[grepl("Trend", col_names , fixed = TRUE)])
+
+#### Urban models 
+fmla <- as.formula(paste("lozone_max ~ treat_rvpI + treat_rvpII + treat_rfg + treat_CARB + income + ", paste(fmla_names, collapse= "+"), "- 1"))
+#model <- lm.cluster(fmla, data = urban_data, cluster = "StateYear")
+#model %>% summary
+
+#                            Estimate   Std. Error      t value     Pr(>|t|)
+#treat_rvpI              3.027416e-03 4.072993e-02   0.07432901 9.407486e-01
+#treat_rvpII            -2.416204e-02 1.561073e-02  -1.54778367 1.216744e-01
+#treat_rfg               1.730365e-02 3.332891e-02   0.51917850 6.036363e-01
+#treat_CARB             -1.596591e-01 5.238513e-02  -3.04779488 2.305272e-03 ***
+#income                  6.613386e-01 6.031045e-01   1.09655732 2.728350e-01
+
+#### Suburban model
+#model <- lm.cluster(fmla, data = suburban_data, cluster = "StateYear")
+#model %>% summary
+
+#                            Estimate   Std. Error     t value     Pr(>|t|)
+#treat_rvpI              4.447066e-02 3.063815e-02  1.45147997 1.466463e-01
+#treat_rvpII             6.155892e-04 1.082221e-02  0.05688204 9.546392e-01
+#treat_rfg               6.791149e-03 3.120342e-02  0.21764120 8.277087e-01
+#treat_CARB             -1.122420e-01 2.722886e-02 -4.12217071 3.753189e-05 ***
+#income                  2.169866e-01 5.684736e-01  0.38170049 7.026835e-01
+
+#### Rural models
+#model <- lm.cluster(fmla, data = rural_data, cluster = "StateYear")
+#model %>% summary
+
+#                            Estimate   Std. Error     t value     Pr(>|t|)
+#treat_rvpI              8.060342e-02 3.613822e-02  2.23042001 2.571957e-02 *
+#treat_rvpII             2.155210e-03 1.220919e-02  0.17652359 8.598826e-01
+#treat_rfg              -1.024394e-02 2.118502e-02 -0.48354622 6.287079e-01
+#treat_CARB             -1.638936e-02 4.071235e-02 -0.40256476 6.872684e-01
+#income                 -4.721146e-02 9.600091e-01 -0.04917814 9.607773e-01
+```
+
+# Reanalyze: Regression Discontinuity to Analyze the Impact of Gasoline Regulations (RVPI, RVPII, RFG, CARB)
+
+Similar to the authors, we reanalyze LA County (CA), Madison County (IL), Camden County (NJ), Harris County (TX).
+
+## Preliminary: Clean Data and Explore Data
+
+### Clean the data to separate CARB, RFG, RVP counties (this is mutually exclusive)
+
+```{r}
+df_temp7 <- df %>% mutate(treat_CARB = as.factor(treat_CARB),
+              treat_rfg = as.factor(treat_rfg),
+              treat_rvpI = as.factor(treat_rvpI),
+              treat_rvpII = as.factor(treat_rvpII)) %>%
+              mutate(DOW = as.POSIXlt(Date)$wday,
+                     DOM = as.POSIXlt(Date)$mday,
+                     DOY = as.POSIXlt(Date)$yday)
+CARB_df <- df_temp7 %>% filter(year <= 2003 & CARBCty == 1 ) 
+rfg_df <- df_temp7 %>% filter(year <= 2003 & CARBCty==0 & RVPCty==0 & RFGCty==1) 
+rvp_df <- df_temp7 %>% filter(year <= 2003 & CARBCty==0 & RVPCty==1 & RFGCty==0) 
+```
+
+### Visually assess the impact of a policy for groups of counties affected by different policies
+
+#### CARB Counties (CA)
+
+```{r}
+# Plot of all CARB counties
+ggplot(CARB_df, aes(color = treat_CARB)) + geom_line(aes(x = Date, y = ozone_max), linewidth = 0.35, alpha = 0.05) + ggtitle("Line Plot of Daily Max Ozone Values for CARB Counties") + ylab("Daily Ozone Max") + xlab("Date")
+
+ggplot(CARB_df, aes(color = treat_CARB)) + geom_line(aes(x = Date, y = epa_8hr), linewidth = 0.35, alpha = 0.05) + ggtitle("Line Plot of 8hr Max Ozone Values for CARB Counties") + ylab("8 Hour Ozone Max") + xlab("Date")
+
+# Let's look at LA specifically
+#LA County FIPS = 006037
+LA_CARB_df <- CARB_df %>% filter(fips == 6037)
+ggplot(LA_CARB_df, aes(color = treat_CARB)) + geom_line(aes(x = Date, y = ozone_max), linewidth = 0.35, alpha = 0.25) + ggtitle("Line Plot of Daily Max Ozone Values for LA County") + ylab("Daily Ozone Max") + xlab("Date")
+
+ggplot(LA_CARB_df, aes(color = treat_CARB)) + geom_line(aes(x = Date, y = epa_8hr), linewidth = 0.35, alpha = 0.25) + ggtitle("Line Plot of 8hr Max Ozone Values for LA CARB County") + ylab("8 Hour Daily Ozone Max") + xlab("Date")
+
+# We can analyze the effect of CARB for different x-axis values for LA. Specifically, let's examine day of the month and day of the year
+LA_CARB_df <- CARB_df %>% filter(fips == 6037)
+
+ggplot(LA_CARB_df, aes(color = treat_CARB)) + geom_line(aes(x = DOY, y = ozone_max), size = 0.35, alpha = 0.25) + ggtitle("Line Plot of Daily Max Ozone Values for LA County") + ylab("Daily Ozone Max") + xlab("Day of the Year")
+
+ggplot(LA_CARB_df, aes(color = treat_CARB)) + geom_jitter(aes(x = DOY, y = epa_8hr), width = 0.5, size = 0.35, alpha = 0.25) + ggtitle("Jitter Plot of 8hr Max Ozone Values for LA County") + ylab("8 Hour Ozone Max") + xlab("Day of the Year")
+
+# Use line plots (geom_smooth) to capture the trend
+ggplot(LA_CARB_df, aes(color = treat_CARB)) + geom_smooth(aes(x = DOM, y = ozone_max), size = 0.35, alpha = 0.25) + ggtitle("Line Plot of Daily Max Ozone Values for LA County") + ylab("Daily Ozone Max") + xlab("Day of the Month")
+
+ggplot(LA_CARB_df, aes(color = treat_CARB)) + geom_smooth(aes(x = DOM, y = epa_8hr), size = 0.35, alpha = 0.25) + ggtitle("Line Plot of 8hr Max Ozone Values for LA County") + ylab("8 Hour Ozone Max") + xlab("Day of the Month")
+
+# Examine and compare site 1201 and 1701
+
+LA_CARB_df1701 <- LA_CARB_df %>% filter(site_id == 1701)
+LA_CARB_df1201 <- LA_CARB_df %>% filter(site_id == 1201)
+
+ggplot(LA_CARB_df1701, aes(color = treat_CARB)) + geom_line(aes(x = Date, y = ozone_max), size = 0.35, alpha = 0.25) + ggtitle("Line Plot of Daily Max Ozone Values for LA County Site 1701") + ylab("Daily Ozone Max") + xlab("Date")
+
+ggplot(LA_CARB_df1201, aes(color = treat_CARB)) + geom_line(aes(x = Date, y = ozone_max), size = 0.35, alpha = 0.25) + ggtitle("Line Plot of Daily Max Ozone Values for LA County Site 1201") + ylab("Daily Ozone Max") + xlab("Date")
+
+# Notes: visually no striking differences. We should go to our statistical analysis to derive some estimate for the causal effect at the changepoint. 
+
+```
+
+#### RFG/RVP Counties
+
+Because RFG and RVP policies only applied from months 6-8, we decided to compare ozone emissions based off of day of the month (DOM) and day of the year (DOY) to assess visual differences. As such, we did not use Date for the x-axis since there is no "non-treatment" group to compare to from months 6-8.
+
+##### Madison County, Illinois (RVPII)
+
+```{r}
+# Madison County, Illinois (RVPII)
+MADCty_RVP_df <- rvp_df %>% filter(fips == 17119)
+ggplot(MADCty_RVP_df, aes(color = treat_rvpII)) + geom_smooth(aes(x = DOY, y = ozone_max), alpha = 0.25) + ggtitle("Line Plot of Daily Max Ozone Values for Madison County") + ylab("Daily Ozone Max") + xlab("Day of the Year")
+
+ggplot(MADCty_RVP_df, aes(color = treat_rvpII)) + geom_smooth(aes(x = DOY, y = epa_8hr), alpha = 0.25) + ggtitle("Line Plot of 8hr Max Ozone Values for Madison County") + ylab("8 Hour Ozone Max") + xlab("Day of the Year")
+
+# DOM
+ggplot(MADCty_RVP_df, aes(color = treat_rvpII)) + geom_smooth(aes(x = DOM, y = ozone_max), alpha = 0.25) + ggtitle("Line Plot of Daily Max Ozone Values for Madison County") + ylab("Daily Ozone Max") + xlab("Day of the Month")
+
+ggplot(MADCty_RVP_df, aes(color = treat_rvpII)) + geom_smooth(aes(x = DOM, y = epa_8hr), alpha = 0.25) + ggtitle("Line Plot of 8hr Max Ozone Values for Madison County") + ylab("8 Hour Ozone Max") + xlab("Day of the Month")
+```
+
+##### Camden County, New Jersey (RFG)
+
+```{r}
+# Camden County, New Jersey (RFG)
+CAMCty_RFG_df <- rfg_df %>% filter(fips == 34007)
+ggplot(CAMCty_RFG_df, aes(color = treat_rfg)) + geom_smooth(aes(x = DOY, y = ozone_max), alpha = 0.25) + ggtitle("Line Plot of Daily Max Ozone Values for Camden County") + ylab("Daily Ozone Max") + xlab("Day of the Year")
+
+ggplot(CAMCty_RFG_df, aes(color = treat_rfg)) + geom_smooth(aes(x = DOY, y = epa_8hr), alpha = 0.25) + ggtitle("Line Plot of 8hr Max Ozone Values for Camden County") + ylab("8 Hour Ozone Max") + xlab("Day of the Year")
+
+# DOM
+ggplot(CAMCty_RFG_df, aes(color = treat_rfg)) + geom_smooth(aes(x = DOM, y = ozone_max), alpha = 0.25) + ggtitle("Line Plot of Daily Max Ozone Values for Camden County") + ylab("Daily Ozone Max") + xlab("Day of the Month")
+
+ggplot(CAMCty_RFG_df, aes(color = treat_rfg)) + geom_smooth(aes(x = DOM, y = epa_8hr), alpha = 0.25) + ggtitle("Line Plot of 8hr Max Ozone Values for Camden County") + ylab("8 Hour Ozone Max") + xlab("Day of the Month")
+```
+
+##### Harris County, Texas (RFG)
+
+```{r}
+# Harris County, Texas RFG
+HARCty_RFG_df <- df_temp7 %>% filter(fips == 48201)
+ggplot(HARCty_RFG_df, aes(color = treat_rfg)) + geom_smooth(aes(x = DOY, y = ozone_max), alpha = 0.25) + ggtitle("Line Plot of Daily Max Ozone Values for Harris County") + ylab("Daily Ozone Max") + xlab("Day of the Year")
+
+ggplot(HARCty_RFG_df, aes(color = treat_rfg)) + geom_smooth(aes(x = DOY, y = epa_8hr), alpha = 0.25) + ggtitle("Line Plot of 8hr Max Ozone Values for Harris County") + ylab("8 Hour Ozone Max") + xlab("Day of the Year")
+
+```
+
+## Reanalyze: Regression Discontinuity Analysis of LA County Results (CARB)
+
+We specifically focused on reanalyzing the impact of CARB counties because the policy was in effect from March 1996. We do not analyze RVPI, RVPII, and RFG because the policies were only active during the months of June, July, and August, making the RD framework inappropriate for this setting.
+
+```{r}
+# Let's specifically empirically analyze LA county using the RD framework
+# Scale date to be continuous. 
+LA_CARB_df["date"] = as.POSIXlt(LA_CARB_df$Date)$year + as.POSIXlt(LA_CARB_df$Date)$yday/365
+# Center at discontinuity point (should be January 1996; it is represented as 96 in our data)
+mean_date <- mean(LA_CARB_df$date) 
+LA_CARB_df <- LA_CARB_df %>% mutate(date_scaled = date - (96))
+RDDest = rdrobust(LA_CARB_df$ozone_max, LA_CARB_df$date_scaled)
+cbind(RDDest$coef, RDDest$ci)
+```
+
+### LA county site 1201 and 1701 (CARB)
+
+```{r}
+# SITE 1201
+LA_CARB_df1201["date"] = as.POSIXlt(LA_CARB_df1201$Date)$year + as.POSIXlt(LA_CARB_df1201$Date)$yday/365
+# Center at discontinuity point (should be January 1996)
+mean_date <- mean(LA_CARB_df1201$date)
+LA_CARB_df1201 <- LA_CARB_df1201 %>% mutate(date_scaled = date - (96))
+# rdrobust on ozone_max
+RDDest = rdrobust(LA_CARB_df1201$ozone_max, LA_CARB_df1201$date_scaled)
+cbind(RDDest$coef, RDDest$ci)
+# rdrobust on epa8_hr
+RDDest = rdrobust(LA_CARB_df1201$epa_8hr, LA_CARB_df1201$date_scaled)
+cbind(RDDest$coef, RDDest$ci)
+
+# SITE 1701
+LA_CARB_df1701["date"] = as.POSIXlt(LA_CARB_df1701$Date)$year + as.POSIXlt(LA_CARB_df1701$Date)$yday/365
+# Center at discontinuity point (should be January 1996)
+mean_date <- mean(LA_CARB_df1701$date)
+LA_CARB_df1701 <- LA_CARB_df1701 %>% mutate(date_scaled = date - (96 ))
+# rdrobust on ozone_max
+RDDest = rdrobust(LA_CARB_df1701$ozone_max, LA_CARB_df1701$date_scaled)
+cbind(RDDest$coef, RDDest$ci)
+# rdrobust on epa8_hr
+RDDest = rdrobust(LA_CARB_df1201$epa_8hr, LA_CARB_df1201$date_scaled)
+cbind(RDDest$coef, RDDest$ci)
+```
